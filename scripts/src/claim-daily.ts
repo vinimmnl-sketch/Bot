@@ -390,14 +390,14 @@ async function createCoinflip(page: Page): Promise<void> {
       return;
     }
 
+    // API expects amount in displayed tokens (not micro-units)
     const betTokens = Math.min(Math.max(minBet, Math.floor(balanceTokens / 2)), maxBet);
-    const betUnits = Math.round(betTokens * UNIT_FACTOR);
     const side = Math.random() > 0.5 ? "heads" : "tails";
 
     console.log(`[INFO] Creating coinflip: ${betTokens} tokens as ${side.toUpperCase()}...`);
 
     const result = await page.evaluate(
-      async ({ betUnits, side }: { betUnits: number; side: string }) => {
+      async ({ betTokens, side }: { betTokens: number; side: string }) => {
         const res = await fetch("https://api.mm2.bet/api/games/coinflip", {
           method: "POST",
           credentials: "include",
@@ -405,38 +405,18 @@ async function createCoinflip(page: Page): Promise<void> {
             "Content-Type": "application/json",
             "X-Requested-With": "XMLHttpRequest",
           },
-          body: JSON.stringify({ side, amount: betUnits }),
+          body: JSON.stringify({ side, amount: betTokens }),
         });
         const text = await res.text();
         return { status: res.status, body: text.slice(0, 500) };
       },
-      { betUnits, side }
+      { betTokens, side }
     );
 
     if (result.status === 200 || result.status === 201) {
       console.log(`[SUCCESS] Coinflip created! ${betTokens} tokens as ${side.toUpperCase()}`);
     } else {
       console.log(`[WARN] Coinflip API returned ${result.status}: ${result.body}`);
-
-      if (result.body.includes("amount") || result.body.includes("min")) {
-        const retryResult = await page.evaluate(
-          async ({ betUnits, side }: { betUnits: number; side: string }) => {
-            const res = await fetch("https://api.mm2.bet/api/games/coinflip", {
-              method: "POST",
-              credentials: "include",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-              },
-              body: JSON.stringify({ side, amount: betUnits }),
-            });
-            const text = await res.text();
-            return { status: res.status, body: text.slice(0, 500) };
-          },
-          { betUnits: Math.round(minBet * UNIT_FACTOR), side }
-        );
-        console.log(`[INFO] Retry with min bet: status=${retryResult.status} ${retryResult.body}`);
-      }
     }
   } catch (err) {
     console.log("[WARN] Coinflip creation failed:", (err as Error).message);

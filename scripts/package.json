@@ -8,6 +8,7 @@
     "claim-daily": "tsx ./src/claim-daily.ts",
     "chat-only": "tsx ./src/chat-only.ts",
     "daily-runner": "tsx ./src/daily-runner.ts",
+    "bot-service": "tsx ./src/bot-service.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
@@ -15,6 +16,8 @@
     "tsx": "catalog:"
   },
   "dependencies": {
+    "@types/express": "^5.0.6",
+    "express": "^5.2.1",
     "playwright": "^1.50.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
