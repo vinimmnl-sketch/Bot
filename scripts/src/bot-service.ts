@@ -288,6 +288,12 @@ async function login(page: Page, context: BrowserContext): Promise<boolean> {
   page.on("request", requestListener);
   const popupPromise = context.waitForEvent("page", { timeout: 5000 }).catch(() => null);
   await loginButton.click();
+  await page.waitForTimeout(1000);
+
+  const continueWithDiscord = page.locator('button:has-text("Continue with Discord")').last();
+  if (await continueWithDiscord.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await continueWithDiscord.click();
+  }
 
   const popup = await popupPromise;
   const authPage = popup ?? page;
