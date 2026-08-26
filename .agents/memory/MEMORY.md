@@ -1,0 +1,1 @@
+- [mm2.bet sign-in flow](mm2-login-flow.md) — mm2.bet chat sign-in opens a dialog before the live Discord OAuth redirect.

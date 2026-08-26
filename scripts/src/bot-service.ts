@@ -273,8 +273,18 @@ async function login(page: Page, context: BrowserContext): Promise<boolean> {
     return true;
   }
 
-  const loginButton = page.locator('button:has-text("Login"), a:has-text("Login"), button:has-text("Sign In")').first();
-  if (!(await loginButton.isVisible({ timeout: 5000 }).catch(() => false))) {
+  const directChatSignIn = page.getByRole("button", {
+    name: "Sign in with Discord to chat",
+    exact: true,
+  });
+  const topSignIn = page.locator(
+    'button:has-text("Login"), a:has-text("Login"), button:has-text("Sign In")',
+  ).first();
+  const signInButton = (await directChatSignIn.isVisible({ timeout: 3000 }).catch(() => false))
+    ? directChatSignIn
+    : topSignIn;
+
+  if (!(await signInButton.isVisible({ timeout: 5000 }).catch(() => false))) {
     console.error("[LOGIN] Login button was not found.");
     return false;
   }
@@ -287,10 +297,12 @@ async function login(page: Page, context: BrowserContext): Promise<boolean> {
 
   page.on("request", requestListener);
   const popupPromise = context.waitForEvent("page", { timeout: 5000 }).catch(() => null);
-  await loginButton.click();
+  await signInButton.click();
   await page.waitForTimeout(1000);
 
-  const continueWithDiscord = page.locator('button:has-text("Continue with Discord")').last();
+  const continueWithDiscord = page.getByRole("button", {
+    name: /Continue with Discord/i,
+  }).last();
   if (await continueWithDiscord.isVisible({ timeout: 3000 }).catch(() => false)) {
     await continueWithDiscord.click();
   }
@@ -485,11 +497,7 @@ async function main(): Promise<void> {
         const waitMs = Math.max(5000, nextChatAt - Date.now());
         await sleep(Math.min(waitMs, 30000));
 
-        const stillSignedIn = await page
-          .locator('[class*="avatar"], [class*="balance"]')
-          .first()
-          .isVisible({ timeout: 3000 })
-          .catch(() => false);
+        const stillSignedIn = Boolean(await findChatInput(page));
 
         if (!stillSignedIn) {
           console.log("[BOT] Login session expired; reconnecting.");
