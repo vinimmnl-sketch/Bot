@@ -1,10 +1,10 @@
 /**
- * Entry point for the mm2.bet bot workflow.
- * Delegates to the persistent bot-service which handles all scheduling internally.
+ * Entry point for the mm2.bet chat-only workflow.
+ * Delegates to the persistent service, which handles chat scheduling.
  */
 import { execSync } from "child_process";
 
-console.log("[RUNNER] Starting mm2.bet bot service...");
+console.log("[RUNNER] Starting mm2.bet chat-only service...");
 
 try {
   execSync("npx tsx ./src/bot-service.ts", {

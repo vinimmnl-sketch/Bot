@@ -1,111 +1,117 @@
 /**
- * mm2.bet Persistent Bot Service
- * - Express keepalive server (ping with UptimeRobot for 24/7)
- * - Discord webhook notifications for every action
- * - Scramble word solver via Socket.IO WebSocket monitoring
- * - Rain / giveaway / event auto-joiner
- * - Daily reward, coinflip, periodic chat
+ * mm2.bet chat-only bot service.
+ *
+ * The service deliberately does one thing: log in and send chat messages on a
+ * schedule. It does not visit rewards or game pages, place bets, join events,
+ * solve scrambles, or monitor game results.
  */
 
 import express from "express";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import type { Page, WebSocket } from "playwright";
-import { solveScramble } from "./dictionary.js";
+import type { BrowserContext, Page } from "playwright";
 import { execSync } from "child_process";
 
 chromium.use(StealthPlugin());
 
-// ─── Config ───────────────────────────────────────────────────────────────────
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const MM2BET_URL = "https://mm2.bet";
-const API_BASE = "https://api.mm2.bet";
-const WEBHOOK_URL =
-  "https://discord.com/api/webhooks/1490799299314061322/F606rnhKhBRCdRJ7-XzvFtYK2HxDfxC_Kx6baXzE2Cmi5qmO2o6Efuv6YAjT_cmzlBGl";
-const PORT = parseInt(process.env.PORT ?? "3000");
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const CHAT_INTERVAL_MS = 3 * 60 * 60 * 1000;
+const MESSAGE_DELAY_MIN_MS = 12 * 1000;
+const MESSAGE_DELAY_MAX_MS = 30 * 1000;
+const RECONNECT_DELAY_MS = 30 * 1000;
 
 if (!DISCORD_TOKEN) {
-  console.error("[ERROR] DISCORD_TOKEN not set.");
+  console.error("[ERROR] DISCORD_TOKEN is not set.");
   process.exit(1);
 }
 
-// ─── Find Chromium ────────────────────────────────────────────────────────────
+if (!DISCORD_WEBHOOK_URL) {
+  console.error("[ERROR] DISCORD_WEBHOOK_URL is not set.");
+  process.exit(1);
+}
+
+const WEBHOOK_URL: string = DISCORD_WEBHOOK_URL;
+
 function findChromium(): string {
   if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
+
   const candidates = [
     "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
   ];
-  for (const p of candidates) {
-    try { execSync(`test -x "${p}"`, { stdio: "ignore" }); return p; } catch {}
+
+  for (const candidate of candidates) {
+    try {
+      execSync(`test -x "${candidate}"`, { stdio: "ignore" });
+      return candidate;
+    } catch {}
   }
+
   try {
-    const f = execSync("which chromium || which chromium-browser || which google-chrome 2>/dev/null", { encoding: "utf8" }).trim();
-    if (f) return f;
-  } catch {}
-  return "";
+    return execSync("which chromium || which chromium-browser || which google-chrome 2>/dev/null", {
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return "";
+  }
 }
+
 const CHROMIUM_PATH = findChromium();
+const botStartTime = Date.now();
+let botStatus = "Starting";
+let lastChatAt = 0;
+let messagesSent = 0;
+let sessionsCompleted = 0;
+let accountLabel = "mm2.bet account";
 
-// ─── Bot state ────────────────────────────────────────────────────────────────
-let lastDailyClaim = 0;
-let lastChat = 0;
-let activeScramble: { word: string; answeredAt: number } | null = null;
-let lastRainJoined = "";
-let lastGiveawayJoined = "";
-let myUserId = 2008; // discovered dynamically after login
-let myUsername = "Ken";
-let lastCoinflipUid = "";
-let botStatus = "Starting...";
-const botStartTime = new Date();
-const stats = { wins: 0, losses: 0, wagered: 0, earned: 0, scramblesAnswered: 0, rainJoins: 0, giveawayJoins: 0 };
-
-// ─── Timing ───────────────────────────────────────────────────────────────────
-const DAILY_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const CHAT_INTERVAL_MS = 3 * 60 * 60 * 1000;
-const EVENT_POLL_INTERVAL_MS = 8000;
-const RECONNECT_DELAY_MS = 30000;
-
-// ─── Chat messages ────────────────────────────────────────────────────────────
 const CHAT_MESSAGES = [
-  "gl everyone", "gg", "lets go!", "good luck", "nice one", "wp",
-  "any coinflips?", "lets get it", "letsgooo", "nice", "gz",
-  "let's go", "hype", "good game everyone", "rip", "gg wp",
-  "so close", "almost", "anyone wanna coinflip?", "lets gooo",
+  "gl everyone",
+  "gg",
+  "lets go!",
+  "good luck",
+  "nice one",
+  "wp",
+  "lets get it",
+  "letsgooo",
+  "nice",
+  "gz",
+  "let's go",
+  "hype",
+  "gg wp",
+  "so close",
+  "almost",
+  "rip",
+  "lets gooo",
+  "good game everyone",
+  "gn all",
 ];
 
-function randomItem<T>(arr: T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
+const CHAT_INPUT_SELECTORS = [
+  'input[placeholder*="message"]',
+  'input[placeholder*="Message"]',
+  'textarea[placeholder*="message"]',
+  '[class*="chat"] input',
+  '[class*="Chat"] input',
+];
 
-function sleep(ms: number) {
-  return new Promise<void>((r) => setTimeout(r, ms));
-}
-
-function uptime(): string {
-  const ms = Date.now() - botStartTime.getTime();
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  return `${h}h ${m}m`;
-}
-
-// ─── Discord Webhook ──────────────────────────────────────────────────────────
 const COLORS = {
-  green:  0x00d26a,
-  red:    0xff4444,
+  green: 0x00d26a,
+  blue: 0x5865f2,
   orange: 0xff8c00,
-  yellow: 0xffd700,
-  blue:   0x0099ff,
-  purple: 0x9b59b6,
-  pink:   0xff69b4,
-  cyan:   0x00bcd4,
-  gray:   0x95a5a6,
-  gold:   0xf1c40f,
+  red: 0xed4245,
 };
 
-interface EmbedField { name: string; value: string; inline?: boolean }
+interface EmbedField {
+  name: string;
+  value: string;
+  inline?: boolean;
+}
+
 interface DiscordEmbed {
   title: string;
   description?: string;
@@ -113,7 +119,21 @@ interface DiscordEmbed {
   fields?: EmbedField[];
   footer?: { text: string };
   timestamp?: string;
-  thumbnail?: { url: string };
+}
+
+function randomItem<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function uptime(): string {
+  const totalMinutes = Math.floor((Date.now() - botStartTime) / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
 }
 
 let webhookQueue: DiscordEmbed[] = [];
@@ -122,542 +142,298 @@ let webhookSending = false;
 async function flushWebhookQueue(): Promise<void> {
   if (webhookSending || webhookQueue.length === 0) return;
   webhookSending = true;
+
   while (webhookQueue.length > 0) {
-    const embed = webhookQueue.shift()!;
+    const embed = webhookQueue.shift();
+    if (!embed) continue;
+
     try {
-      await fetch(WEBHOOK_URL, {
+      const response = await fetch(WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ embeds: [embed] }),
       });
-    } catch {}
-    if (webhookQueue.length > 0) await sleep(1000); // rate limit guard
+
+      if (!response.ok) {
+        console.error(`[WEBHOOK] Discord returned ${response.status}.`);
+      }
+    } catch (error) {
+      console.error("[WEBHOOK] Could not send notification:", (error as Error).message);
+    }
+
+    if (webhookQueue.length > 0) await sleep(1000);
   }
+
   webhookSending = false;
 }
 
 function sendWebhook(embed: DiscordEmbed): void {
-  embed.timestamp = new Date().toISOString();
-  embed.footer = { text: `mm2.bet Bot • Uptime: ${uptime()} • W:${stats.wins} L:${stats.losses}` };
-  webhookQueue.push(embed);
-  flushWebhookQueue().catch(() => {});
+  webhookQueue.push({
+    ...embed,
+    timestamp: new Date().toISOString(),
+    footer: { text: `mm2.bet Chat Bot • Uptime: ${uptime()} • Messages: ${messagesSent}` },
+  });
+  flushWebhookQueue().catch((error) => {
+    console.error("[WEBHOOK] Queue error:", (error as Error).message);
+  });
 }
 
-// ─── Express keepalive server ─────────────────────────────────────────────────
 const app = express();
 
-app.get("/", (_req, res) => {
-  res.send("Bot is alive! ✅");
+app.get("/", (_request, response) => {
+  response.send("Chat bot is alive! ✅");
 });
 
-app.get("/status", (_req, res) => {
-  res.json({
+app.get("/status", (_request, response) => {
+  response.json({
     status: botStatus,
     uptime: uptime(),
-    user: myUsername,
-    stats,
-    lastDailyClaim: lastDailyClaim ? new Date(lastDailyClaim).toISOString() : null,
-    lastChat: lastChat ? new Date(lastChat).toISOString() : null,
+    account: accountLabel,
+    messagesSent,
+    sessionsCompleted,
+    lastChat: lastChatAt ? new Date(lastChatAt).toISOString() : null,
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`[BOT] Keep-alive server on :${PORT} — point UptimeRobot here`);
+  console.log(`[BOT] Chat-only keep-alive server listening on :${PORT}`);
 });
 
-// ─── Login ────────────────────────────────────────────────────────────────────
-async function login(page: Page): Promise<boolean> {
-  console.log("[BOT] Navigating to mm2.bet...");
-  await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(3000);
-
-  const signedIn = await page.locator('[class*="avatar"], [class*="balance"]').first().isVisible({ timeout: 3000 }).catch(() => false);
-  if (signedIn) { console.log("[BOT] Already logged in."); return true; }
-
-  const loginBtn = page.locator('button:has-text("Login"), button:has-text("Sign In")').first();
-  if (!(await loginBtn.isVisible({ timeout: 5000 }))) return false;
-
-  let oauthUrl: string | null = null;
-  const listener = (req: { url: () => string }) => {
-    const u = req.url();
-    if (u.includes("discord.com") && u.includes("oauth2/authorize")) oauthUrl = u;
-  };
-  page.on("request", listener);
-  await loginBtn.click();
-  let waited = 0;
-  while (!oauthUrl && waited < 10000) { await sleep(300); waited += 300; }
-  page.off("request", listener);
-  if (!oauthUrl) return false;
-
-  const url = new URL(oauthUrl);
-  const scope = url.searchParams.get("scope") ?? "identify email";
-  const res = await fetch(`https://discord.com/api/v9/oauth2/authorize?${url.searchParams.toString()}`, {
-    method: "POST",
-    headers: { Authorization: DISCORD_TOKEN!, "Content-Type": "application/json", "User-Agent": "Mozilla/5.0", Referer: oauthUrl, Origin: "https://discord.com" },
-    body: JSON.stringify({ authorize: true, permissions: "0", scope: scope.split(/[\s+]/) }),
-  });
-  const data = await res.json() as { location?: string };
-  if (!data.location) return false;
-
-  await page.goto(data.location, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(3000);
-
-  // Fetch my user info
-  const me = await apiCall<{ id: number; username: string }>(page, "/api/auth/me");
-  if (me?.id) { myUserId = me.id; myUsername = me.username ?? myUsername; }
-
-  console.log(`[BOT] Logged in as ${myUsername} (id:${myUserId})`);
-  return page.url().includes("mm2.bet");
-}
-
-// ─── API helper ───────────────────────────────────────────────────────────────
-async function apiCall<T>(page: Page, path: string, method = "GET", body?: unknown): Promise<T | null> {
-  return page.evaluate(
-    async ({ path, method, body, base }: { path: string; method: string; body: unknown; base: string }) => {
-      const res = await fetch(`${base}${path}`, {
-        method,
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-      return res.json().catch(() => null);
-    },
-    { path, method, body, base: API_BASE }
-  ) as Promise<T | null>;
-}
-
-// ─── Chat ─────────────────────────────────────────────────────────────────────
-async function sendChat(page: Page, message: string): Promise<boolean> {
+function extractOAuthUrl(rawUrl: string): string | null {
   try {
-    const input = page.locator('input[placeholder*="message"]').first();
-    if (!(await input.isVisible({ timeout: 3000 }))) {
-      await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
-      await page.waitForTimeout(2000);
+    const url = new URL(rawUrl);
+    const redirectTo = url.searchParams.get("redirect_to");
+    if (redirectTo) {
+      const decoded = decodeURIComponent(redirectTo);
+      if (decoded.includes("oauth2/authorize")) return `https://discord.com${decoded}`;
     }
-    await input.click();
-    await input.fill(message);
-    await page.keyboard.press("Enter");
-    await sleep(500);
-    return true;
-  } catch { return false; }
-}
-
-async function runChatSession(page: Page, count = 3): Promise<void> {
-  console.log(`[CHAT] Sending ${count} messages...`);
-  if (!page.url().includes("mm2.bet")) {
-    await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
-    await page.waitForTimeout(3000);
-  }
-  const input = page.locator('input[placeholder*="message"]').first();
-  if (!(await input.isVisible({ timeout: 5000 }))) { console.log("[WARN] No chat input."); return; }
-
-  const sent: string[] = [];
-  for (let i = 0; i < count; i++) {
-    const msg = randomItem(CHAT_MESSAGES);
-    await input.click();
-    await input.fill(msg);
-    await page.keyboard.press("Enter");
-    sent.push(msg);
-    console.log(`[CHAT] (${i + 1}/${count}): "${msg}"`);
-    await sleep(12000 + Math.random() * 18000);
-  }
-  lastChat = Date.now();
-
-  sendWebhook({
-    title: "💬 Chat Session Complete",
-    description: `Sent **${count}** messages to stay active`,
-    color: COLORS.blue,
-    fields: sent.map((m, i) => ({ name: `Message ${i + 1}`, value: `"${m}"`, inline: true })),
-  });
-}
-
-// ─── Daily reward ─────────────────────────────────────────────────────────────
-async function claimDailyReward(page: Page): Promise<void> {
-  console.log("[DAILY] Claiming...");
-  try {
-    await page.goto(`${MM2BET_URL}/rewards`, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(3000);
-
-    const dailyTab = page.locator('button:has-text("Daily"), [role="tab"]:has-text("Daily")').first();
-    if (await dailyTab.isVisible({ timeout: 3000 })) await dailyTab.click();
-    await page.waitForTimeout(1500);
-
-    // Get streak info
-    const streakEl = await page.locator('[class*="streak"], [class*="day"]').first().innerText().catch(() => "");
-
-    const claimBtn = page.locator('button:has-text("Claim"), button:has-text("CLAIM")').first();
-    if (await claimBtn.isVisible({ timeout: 5000 }) && !(await claimBtn.isDisabled())) {
-      await claimBtn.click();
-      await page.waitForTimeout(3000);
-      console.log("[DAILY] Claimed!");
-      sendWebhook({
-        title: "🎁 Daily Reward Claimed!",
-        description: "Successfully claimed today's daily reward",
-        color: COLORS.gold,
-        fields: [
-          { name: "👤 Account", value: myUsername, inline: true },
-          { name: "📆 Streak Info", value: streakEl || "Active streak", inline: true },
-        ],
-      });
-    } else {
-      console.log("[DAILY] Already claimed.");
-      sendWebhook({
-        title: "📅 Daily Already Claimed",
-        description: "Today's reward was already claimed — will check again tomorrow",
-        color: COLORS.gray,
-        fields: [{ name: "👤 Account", value: myUsername, inline: true }],
-      });
-    }
-  } catch (err) {
-    console.log("[DAILY] Error:", (err as Error).message);
-  }
-}
-
-// ─── Coinflip ─────────────────────────────────────────────────────────────────
-async function createCoinflip(page: Page): Promise<void> {
-  console.log("[COINFLIP] Checking balance...");
-  try {
-    await page.goto(`${MM2BET_URL}/games/coinflip`, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(3000);
-
-    type WalletData = { available_balance: number };
-    type ConfigData = { coinflip: { min_bet_tokens: number; max_bet_tokens: number } };
-
-    const { wallet, config } = await page.evaluate(async (base: string) => {
-      const [w, c] = await Promise.all([
-        fetch(`${base}/api/wallet`, { credentials: "include", headers: { "X-Requested-With": "XMLHttpRequest" } }),
-        fetch(`${base}/api/games/config`, { credentials: "include", headers: { "X-Requested-With": "XMLHttpRequest" } }),
-      ]);
-      return { wallet: await w.json() as WalletData, config: await c.json() as ConfigData };
-    }, API_BASE);
-
-    const balanceTokens = wallet.available_balance / 100000;
-    const minBet = config.coinflip.min_bet_tokens;
-    const maxBet = config.coinflip.max_bet_tokens;
-
-    console.log(`[COINFLIP] Balance: ${balanceTokens.toFixed(4)} | Min: ${minBet}`);
-    if (balanceTokens < minBet) {
-      console.log("[COINFLIP] Balance below minimum. Skipping.");
-      sendWebhook({
-        title: "🎲 Coinflip Skipped",
-        description: `Balance **${balanceTokens.toFixed(4)}** tokens is below the minimum bet of **${minBet}** token`,
-        color: COLORS.gray,
-        fields: [{ name: "💰 Balance", value: `${balanceTokens.toFixed(4)} tokens`, inline: true }],
-      });
-      return;
-    }
-
-    const betTokens = Math.min(Math.max(minBet, Math.floor(balanceTokens / 2)), maxBet);
-    const side = Math.random() > 0.5 ? "heads" : "tails";
-    const sideEmoji = side === "heads" ? "🟠" : "🔵";
-
-    console.log(`[COINFLIP] Creating ${betTokens} tokens as ${side.toUpperCase()}...`);
-    const result = await page.evaluate(
-      async ({ betTokens, side, base }: { betTokens: number; side: string; base: string }) => {
-        const res = await fetch(`${base}/api/games/coinflip`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
-          body: JSON.stringify({ side, amount: betTokens }),
-        });
-        const text = await res.text();
-        return { status: res.status, body: text.slice(0, 500) };
-      },
-      { betTokens, side, base: API_BASE }
-    );
-
-    if (result.status === 200 || result.status === 201) {
-      console.log(`[COINFLIP] Created! ${betTokens} tokens as ${side.toUpperCase()}`);
-      stats.wagered += betTokens;
-
-      // Try to get game uid from response
-      try {
-        const parsed = JSON.parse(result.body) as { game?: { uid?: string } };
-        if (parsed.game?.uid) lastCoinflipUid = parsed.game.uid;
-      } catch {}
-
-      sendWebhook({
-        title: `🎲 Coinflip Created!`,
-        description: `Waiting for someone to join your coinflip`,
-        color: COLORS.orange,
-        fields: [
-          { name: `${sideEmoji} Side`, value: side.toUpperCase(), inline: true },
-          { name: "💰 Bet", value: `${betTokens} tokens`, inline: true },
-          { name: "⚖️ Balance Before", value: `${balanceTokens.toFixed(2)} tokens`, inline: true },
-        ],
-      });
-    } else {
-      console.log(`[COINFLIP] Failed ${result.status}: ${result.body}`);
-      sendWebhook({
-        title: "⚠️ Coinflip Error",
-        description: `API returned ${result.status}`,
-        color: COLORS.red,
-        fields: [{ name: "Response", value: `\`\`\`${result.body.slice(0, 200)}\`\`\`` }],
-      });
-    }
-  } catch (err) {
-    console.log("[COINFLIP] Error:", (err as Error).message);
-  }
-}
-
-// ─── Scramble ─────────────────────────────────────────────────────────────────
-function parseScrambleFromFrame(payload: string): string | null {
-  try {
-    if (!payload.startsWith("42")) return null;
-    const json = JSON.parse(payload.slice(2)) as [string, unknown];
-    if (!Array.isArray(json) || json.length < 2) return null;
-    const [eventName, data] = json;
-
-    if (typeof eventName === "string" && /scramble/i.test(eventName)) {
-      const d = data as Record<string, unknown>;
-      const word = String(d.word ?? d.scrambled_word ?? d.scrambled ?? d.letters ?? "");
-      if (word) return word;
-    }
-    if (eventName === "chat_event" && typeof data === "object" && data !== null) {
-      const d = data as Record<string, unknown>;
-      if (typeof d.type === "string" && /scramble/i.test(d.type)) {
-        return String(d.word ?? d.scrambled_word ?? d.letters ?? "");
-      }
-    }
-    if (eventName === "new_message" && typeof data === "object" && data !== null) {
-      const d = data as Record<string, unknown>;
-      const user = d.user as Record<string, unknown> | undefined;
-      const isStaff = user?.is_owner || user?.is_dev || user?.is_admin || user?.is_manager;
-      const msg = String(d.message ?? d.text ?? d.content ?? "");
-      if (isStaff || /scramble|unscramble|🔤|word is/i.test(msg)) {
-        const after = msg.match(/(?:scramble|unscramble|word is|🔤)[:\s]+([a-zA-Z]{3,12})/i);
-        const bold = msg.match(/\*\*([a-zA-Z]{3,12})\*\*/);
-        const caps = msg.match(/\b([A-Z]{4,12})\b/);
-        const word = (after?.[1] ?? bold?.[1] ?? caps?.[1] ?? "").trim();
-        if (word) return word;
-      }
-    }
+    if (rawUrl.includes("oauth2/authorize")) return rawUrl;
   } catch {}
   return null;
 }
 
-// Parse coinflip result from WS frame
-function parseCoinflipResult(payload: string): { uid: string; winnerId: number; creatorId: number; joinerId: number | null; amount: number; creatorUsername: string; joinerUsername: string } | null {
-  try {
-    if (!payload.startsWith("42")) return null;
-    const json = JSON.parse(payload.slice(2)) as [string, unknown];
-    if (!Array.isArray(json) || json.length < 2) return null;
-    const [eventName, data] = json;
-    if (eventName !== "coinflip:game_result") return null;
-    const d = data as Record<string, unknown>;
-    const game = d.game as Record<string, unknown>;
-    if (!game) return null;
-    const creator = game.creator as Record<string, unknown> | undefined;
-    const joiner = game.joiner as Record<string, unknown> | undefined;
-    return {
-      uid: String(game.uid ?? ""),
-      winnerId: Number(game.winner_id ?? game.winner ?? 0),
-      creatorId: Number(creator?.id ?? 0),
-      joinerId: joiner ? Number(joiner.id) : null,
-      amount: Number(game.creator_amount ?? 0) / 100000,
-      creatorUsername: String(creator?.username ?? "?"),
-      joinerUsername: String(joiner?.username ?? "?"),
-    };
-  } catch { return null; }
+async function authorizeDiscordOAuth(oauthUrl: string): Promise<string | null> {
+  const url = new URL(oauthUrl);
+  const scope = url.searchParams.get("scope") ?? "identify email";
+  const response = await fetch(
+    `https://discord.com/api/v9/oauth2/authorize?${url.searchParams.toString()}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: DISCORD_TOKEN,
+        "Content-Type": "application/json",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+        Referer: oauthUrl,
+        Origin: "https://discord.com",
+      },
+      body: JSON.stringify({
+        authorize: true,
+        permissions: "0",
+        scope: scope.split(/[\s+]/),
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(`[LOGIN] Discord authorization returned ${response.status}.`);
+    return null;
+  }
+
+  const data = (await response.json()) as { location?: string };
+  return data.location ?? null;
 }
 
-async function handleScramble(page: Page, scrambledWord: string): Promise<void> {
-  const now = Date.now();
-  if (activeScramble?.word === scrambledWord && now - activeScramble.answeredAt < 60000) return;
+async function waitForCloudflare(page: Page, timeout = 30000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeout) {
+    const title = await page.title().catch(() => "");
+    if (!title.toLowerCase().includes("just a moment") && !title.toLowerCase().includes("checking")) {
+      return;
+    }
+    await page.waitForTimeout(4000);
+  }
+}
 
-  const answer = solveScramble(scrambledWord);
-  if (!answer) {
-    console.log(`[SCRAMBLE] Can't solve: "${scrambledWord}"`);
+async function login(page: Page, context: BrowserContext): Promise<boolean> {
+  botStatus = "Logging in";
+  console.log("[BOT] Opening mm2.bet...");
+  await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await waitForCloudflare(page);
+  await page.waitForTimeout(3000);
+
+  const signedIn = await page
+    .locator('[class*="avatar"], [class*="balance"]')
+    .first()
+    .isVisible({ timeout: 3000 })
+    .catch(() => false);
+
+  if (signedIn) {
+    console.log("[BOT] Already logged in.");
+    return true;
+  }
+
+  const loginButton = page.locator('button:has-text("Login"), a:has-text("Login"), button:has-text("Sign In")').first();
+  if (!(await loginButton.isVisible({ timeout: 5000 }).catch(() => false))) {
+    console.error("[LOGIN] Login button was not found.");
+    return false;
+  }
+
+  let oauthUrl: string | null = null;
+  const requestListener = (request: { url: () => string }) => {
+    const candidate = extractOAuthUrl(request.url());
+    if (candidate) oauthUrl = candidate;
+  };
+
+  page.on("request", requestListener);
+  const popupPromise = context.waitForEvent("page", { timeout: 5000 }).catch(() => null);
+  await loginButton.click();
+
+  const popup = await popupPromise;
+  const authPage = popup ?? page;
+  if (authPage !== page) authPage.on("request", requestListener);
+
+  oauthUrl = extractOAuthUrl(authPage.url()) ?? extractOAuthUrl(page.url());
+  if (!oauthUrl) {
+    await authPage.waitForURL(/discord\.com/, { timeout: 10000 }).catch(() => {});
+    oauthUrl = extractOAuthUrl(authPage.url()) ?? extractOAuthUrl(page.url());
+  }
+
+  let waited = 0;
+  while (!oauthUrl && waited < 10000) {
+    await sleep(300);
+    waited += 300;
+  }
+  page.off("request", requestListener);
+  if (authPage !== page) authPage.off("request", requestListener);
+
+  if (!oauthUrl) {
+    const describePage = (candidate: Page) => {
+      try {
+        const url = new URL(candidate.url());
+        return `${url.hostname}${url.pathname}`;
+      } catch {
+        return "unknown";
+      }
+    };
+    console.error(
+      `[LOGIN] Discord OAuth URL was not found (page=${describePage(page)}, auth=${describePage(authPage)}).`,
+    );
+    return false;
+  }
+
+  const callbackUrl = await authorizeDiscordOAuth(oauthUrl);
+  if (!callbackUrl) return false;
+
+  await page.goto(callbackUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await waitForCloudflare(page);
+  await page.waitForTimeout(4000);
+
+  const loggedIn = page.url().includes("mm2.bet");
+  if (loggedIn) console.log("[BOT] Logged in successfully.");
+  return loggedIn;
+}
+
+async function findChatInput(page: Page) {
+  for (const selector of CHAT_INPUT_SELECTORS) {
+    const input = page.locator(selector).first();
+    if (await input.isVisible({ timeout: 2000 }).catch(() => false)) return input;
+  }
+  return null;
+}
+
+async function sendChatMessage(page: Page, message: string): Promise<boolean> {
+  const input = await findChatInput(page);
+  if (!input) return false;
+
+  await input.click();
+  await input.fill(message);
+  await page.keyboard.press("Enter");
+  await sleep(500);
+  return true;
+}
+
+async function runChatSession(page: Page, count = 3): Promise<void> {
+  botStatus = "Sending chat";
+  if (!page.url().includes("mm2.bet")) {
+    await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
+    await waitForCloudflare(page);
+    await page.waitForTimeout(2000);
+  }
+
+  const input = await findChatInput(page);
+  if (!input) {
+    console.error("[CHAT] Chat input was not found.");
     sendWebhook({
-      title: "🔤 Scramble Detected (Unsolved)",
-      description: `Could not find an answer for the scrambled word`,
-      color: COLORS.gray,
-      fields: [{ name: "🔀 Scrambled", value: `\`${scrambledWord}\``, inline: true }],
+      title: "⚠️ Chat Input Unavailable",
+      description: "The bot is logged in but could not find the mm2.bet chat input.",
+      color: COLORS.red,
     });
     return;
   }
 
-  console.log(`[SCRAMBLE] "${scrambledWord}" → "${answer}"`);
-  activeScramble = { word: scrambledWord, answeredAt: now };
-  await sleep(300 + Math.random() * 700);
-  const sent = await sendChat(page, answer);
-  if (sent) {
-    stats.scramblesAnswered++;
+  let sentThisSession = 0;
+  for (let index = 0; index < count; index++) {
+    const message = randomItem(CHAT_MESSAGES);
+    const sent = await sendChatMessage(page, message);
+    if (!sent) {
+      console.error("[CHAT] Message could not be sent.");
+      sendWebhook({
+        title: "⚠️ Chat Message Failed",
+        description: "The bot could not send the next chat message.",
+        color: COLORS.red,
+      });
+      break;
+    }
+
+    sentThisSession++;
+    messagesSent++;
+    console.log(`[CHAT] Sent (${index + 1}/${count}): "${message}"`);
     sendWebhook({
-      title: "🔤 Scramble Solved!",
-      description: `Answered the scramble puzzle in chat`,
-      color: COLORS.purple,
+      title: "💬 Chat Message Sent",
+      description: "The chat-only bot sent a message on mm2.bet.",
+      color: COLORS.blue,
       fields: [
-        { name: "🔀 Scrambled", value: `\`${scrambledWord}\``, inline: true },
-        { name: "✅ Answer", value: `**${answer}**`, inline: true },
-        { name: "🏆 Total Solved", value: String(stats.scramblesAnswered), inline: true },
+        { name: "📝 Message", value: message, inline: false },
+        { name: "📨 Total Sent", value: String(messagesSent), inline: true },
+        { name: "👤 Account", value: accountLabel, inline: true },
+      ],
+    });
+
+    if (index < count - 1) {
+      await sleep(
+        MESSAGE_DELAY_MIN_MS +
+          Math.random() * (MESSAGE_DELAY_MAX_MS - MESSAGE_DELAY_MIN_MS),
+      );
+    }
+  }
+
+  if (sentThisSession > 0) {
+    lastChatAt = Date.now();
+    sessionsCompleted++;
+    sendWebhook({
+      title: "✅ Chat Session Complete",
+      description: `Sent ${sentThisSession} message${sentThisSession === 1 ? "" : "s"} successfully.`,
+      color: COLORS.green,
+      fields: [
+        { name: "📨 Session Messages", value: String(sentThisSession), inline: true },
+        { name: "📊 Total Messages", value: String(messagesSent), inline: true },
       ],
     });
   }
+  botStatus = "Waiting for next chat session";
 }
 
-// ─── Events ───────────────────────────────────────────────────────────────────
-async function checkAndJoinEvents(page: Page): Promise<void> {
-  try {
-    type RainData = { rain: { id: string; status: string; amount?: number } | null };
-    type GiveawayData = { giveaway: { id: string; status: string; prize?: number } | null };
-    type ChatEventData = { event: { id: string; type: string; scrambled_word?: string } | null };
-
-    const [rainData, giveawayData, chatEventData] = await Promise.all([
-      apiCall<RainData>(page, "/api/rain/active"),
-      apiCall<GiveawayData>(page, "/api/chat-giveaway/active"),
-      apiCall<ChatEventData>(page, "/api/chat-events/active"),
-    ]);
-
-    if (rainData?.rain && rainData.rain.status === "active") {
-      const rainId = String(rainData.rain.id);
-      if (rainId !== lastRainJoined) {
-        console.log("[RAIN] Joining...");
-        const result = await apiCall<{ success?: boolean; error?: unknown }>(page, "/api/rain/join", "POST", { rain_id: rainId });
-        lastRainJoined = rainId;
-        stats.rainJoins++;
-        if (!result?.error) {
-          sendWebhook({
-            title: "🌧️ Rain Joined!",
-            description: "Joined the active token rain — free tokens incoming!",
-            color: COLORS.cyan,
-            fields: [
-              { name: "🎯 Rain ID", value: rainId, inline: true },
-              { name: "🌧️ Total Joined", value: String(stats.rainJoins), inline: true },
-            ],
-          });
-        }
-      }
-    }
-
-    if (giveawayData?.giveaway && giveawayData.giveaway.status === "active") {
-      const id = String(giveawayData.giveaway.id);
-      if (id !== lastGiveawayJoined) {
-        console.log("[GIVEAWAY] Joining...");
-        await apiCall(page, "/api/chat-giveaway/enter", "POST", { giveaway_id: id });
-        lastGiveawayJoined = id;
-        stats.giveawayJoins++;
-        sendWebhook({
-          title: "🎁 Giveaway Entered!",
-          description: "Entered the active chat giveaway — fingers crossed!",
-          color: COLORS.pink,
-          fields: [
-            { name: "🎫 Giveaway ID", value: id, inline: true },
-            { name: "🎁 Total Entered", value: String(stats.giveawayJoins), inline: true },
-          ],
-        });
-      }
-    }
-
-    if (chatEventData?.event) {
-      const ev = chatEventData.event;
-      if (/scramble/i.test(ev.type ?? "") && ev.scrambled_word) {
-        await handleScramble(page, ev.scrambled_word);
-      }
-    }
-  } catch {}
-}
-
-// ─── WebSocket monitor ────────────────────────────────────────────────────────
-function setupWsMonitor(page: Page) {
-  page.on("websocket", (ws: WebSocket) => {
-    ws.on("framereceived", async (frame) => {
-      const payload = frame.payload.toString();
-
-      // Scramble detection
-      const scrambledWord = parseScrambleFromFrame(payload);
-      if (scrambledWord) {
-        await handleScramble(page, scrambledWord).catch(() => {});
-      }
-
-      // Coinflip result
-      const cfResult = parseCoinflipResult(payload);
-      if (cfResult) {
-        const botInvolved = cfResult.creatorId === myUserId || cfResult.joinerId === myUserId;
-        if (botInvolved) {
-          const botWon = cfResult.winnerId === myUserId;
-          const opponent = cfResult.creatorId === myUserId ? cfResult.joinerUsername : cfResult.creatorUsername;
-          if (botWon) {
-            stats.wins++;
-            stats.earned += cfResult.amount;
-            console.log(`[COINFLIP] WON! +${cfResult.amount} tokens vs ${opponent}`);
-            sendWebhook({
-              title: "🏆 Coinflip WON!",
-              description: `Beat **${opponent}** and won the coinflip!`,
-              color: COLORS.green,
-              fields: [
-                { name: "💰 Won", value: `+${cfResult.amount.toFixed(2)} tokens`, inline: true },
-                { name: "😈 Opponent", value: opponent, inline: true },
-                { name: "📊 W/L Record", value: `${stats.wins}W / ${stats.losses}L`, inline: true },
-              ],
-            });
-          } else {
-            stats.losses++;
-            console.log(`[COINFLIP] Lost ${cfResult.amount} tokens vs ${opponent}`);
-            sendWebhook({
-              title: "💸 Coinflip Lost",
-              description: `Lost to **${opponent}** in the coinflip`,
-              color: COLORS.red,
-              fields: [
-                { name: "💸 Lost", value: `-${cfResult.amount.toFixed(2)} tokens`, inline: true },
-                { name: "😤 Opponent", value: opponent, inline: true },
-                { name: "📊 W/L Record", value: `${stats.wins}W / ${stats.losses}L`, inline: true },
-              ],
-            });
-          }
-        }
-      }
-
-      // Someone joined your coinflip
-      if (payload.includes("coinflip:game_joined") && lastCoinflipUid) {
-        try {
-          const json = JSON.parse(payload.slice(2)) as [string, { game?: Record<string, unknown> }];
-          const game = json[1]?.game as Record<string, unknown> | undefined;
-          if (game?.uid === lastCoinflipUid) {
-            const joiner = game.joiner as Record<string, unknown> | undefined;
-            const joinerName = String(joiner?.username ?? "Someone");
-            console.log(`[COINFLIP] ${joinerName} joined your game!`);
-            sendWebhook({
-              title: "⚔️ Coinflip Joined!",
-              description: `**${joinerName}** joined your coinflip — deciding fate...`,
-              color: COLORS.yellow,
-              fields: [{ name: "🕹️ Opponent", value: joinerName, inline: true }],
-            });
-          }
-        } catch {}
-      }
-    });
-  });
-}
-
-// ─── Daily task runner ────────────────────────────────────────────────────────
-async function runDailyTasks(page: Page): Promise<void> {
-  console.log("\n[SCHEDULER] Running daily tasks...");
-  botStatus = "Running daily tasks";
-  await claimDailyReward(page);
-  await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
-  await page.waitForTimeout(2000);
-  await runChatSession(page, 3);
-  await createCoinflip(page);
-  await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
-  await page.waitForTimeout(2000);
-  lastDailyClaim = Date.now();
-  lastChat = Date.now();
-  botStatus = "Polling for events";
-  console.log("[SCHEDULER] Daily tasks complete.");
-}
-
-// ─── Main loop ────────────────────────────────────────────────────────────────
-async function main() {
-  console.log("[BOT SERVICE] Starting mm2.bet bot...");
-
+async function main(): Promise<void> {
+  console.log("[BOT SERVICE] Starting mm2.bet chat-only bot...");
   sendWebhook({
-    title: "🤖 mm2.bet Bot Started",
-    description: "Bot is now running and monitoring for events 24/7",
+    title: "🤖 Chat-Only Bot Started",
+    description: "The bot is running and will only send scheduled chat messages.",
     color: COLORS.green,
     fields: [
-      { name: "🎮 Features", value: "Daily Claim • Coinflip • Chat • Scramble Solver • Rain/Giveaway Joiner", inline: false },
-      { name: "⏰ Schedule", value: "Daily tasks every 24h • Chat every 3h • Events polled every 8s", inline: false },
+      { name: "💬 Mode", value: "Chat only", inline: true },
+      { name: "⏱️ Schedule", value: "Every 3 hours", inline: true },
+      { name: "🚫 Disabled", value: "Rewards, games, bets, event joins, scramble solving, and result tracking", inline: false },
     ],
   });
 
@@ -669,65 +445,75 @@ async function main() {
     });
 
     try {
-      const page = await browser.newPage();
-      setupWsMonitor(page);
-      botStatus = "Logging in";
+      const context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 720 },
+      });
+      const page = await context.newPage();
 
-      const loggedIn = await login(page);
+      const loggedIn = await login(page, context);
       if (!loggedIn) {
-        console.log("[BOT] Login failed. Retrying in 30s...");
-        sendWebhook({ title: "⚠️ Login Failed", description: "Will retry in 30 seconds", color: COLORS.red });
+        botStatus = "Login failed; retrying";
+        sendWebhook({
+          title: "⚠️ Login Failed",
+          description: `The bot will retry in ${RECONNECT_DELAY_MS / 1000} seconds.`,
+          color: COLORS.red,
+        });
         await browser.close();
         await sleep(RECONNECT_DELAY_MS);
         continue;
       }
 
-      botStatus = "Running daily tasks";
-      await runDailyTasks(page);
+      accountLabel = "Authenticated mm2.bet account";
+      sendWebhook({
+        title: "🔐 Account Connected",
+        description: "The chat-only bot is logged in and ready.",
+        color: COLORS.green,
+      });
 
-      let pollCount = 0;
+      await runChatSession(page);
+
+      let nextChatAt = Date.now() + CHAT_INTERVAL_MS;
       while (true) {
-        await sleep(EVENT_POLL_INTERVAL_MS);
-        pollCount++;
+        const waitMs = Math.max(5000, nextChatAt - Date.now());
+        await sleep(Math.min(waitMs, 30000));
 
-        await checkAndJoinEvents(page);
+        const stillSignedIn = await page
+          .locator('[class*="avatar"], [class*="balance"]')
+          .first()
+          .isVisible({ timeout: 3000 })
+          .catch(() => false);
 
-        const now = Date.now();
-        if (now - lastDailyClaim >= DAILY_INTERVAL_MS) {
-          await runDailyTasks(page);
-        } else if (now - lastChat >= CHAT_INTERVAL_MS) {
-          await page.goto(MM2BET_URL, { waitUntil: "domcontentloaded", timeout: 20000 });
-          await page.waitForTimeout(2000);
-          await runChatSession(page, 3);
+        if (!stillSignedIn) {
+          console.log("[BOT] Login session expired; reconnecting.");
+          break;
         }
 
-        // Re-login check every ~30 min
-        if (pollCount % 225 === 0) {
-          const ok = await page.locator('[class*="balance"], [class*="avatar"]').first().isVisible({ timeout: 5000 }).catch(() => false);
-          if (!ok) {
-            console.log("[BOT] Session expired — re-logging in...");
-            await login(page);
-          }
+        if (Date.now() >= nextChatAt) {
+          await runChatSession(page);
+          nextChatAt = Date.now() + CHAT_INTERVAL_MS;
         }
       }
-    } catch (err) {
-      console.log("[BOT] Crash:", (err as Error).message);
+    } catch (error) {
+      botStatus = "Restarting after error";
+      console.error("[BOT] Error:", (error as Error).message);
       sendWebhook({
-        title: "🔄 Bot Restarting",
-        description: `Encountered an error — restarting in 30 seconds`,
+        title: "🔄 Chat Bot Restarting",
+        description: "The bot encountered an error and will reconnect.",
         color: COLORS.orange,
-        fields: [{ name: "❗ Error", value: (err as Error).message?.slice(0, 200) ?? "Unknown" }],
+        fields: [{ name: "❗ Error", value: (error as Error).message.slice(0, 200) || "Unknown error" }],
       });
     } finally {
       await browser.close().catch(() => {});
     }
 
-    botStatus = "Reconnecting...";
+    botStatus = "Reconnecting";
     await sleep(RECONNECT_DELAY_MS);
   }
 }
 
-main().catch((err) => {
-  console.error("[FATAL]", err);
+main().catch((error) => {
+  console.error("[FATAL]", error);
   process.exit(1);
 });
